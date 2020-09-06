@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ type MediaType string
 const (
 	MediaImage    MediaType = "WhatsApp Image Keys"
 	MediaVideo    MediaType = "WhatsApp Video Keys"
+	MediaSticker  MediaType = "WhatsApp Sticker Keys"
 	MediaAudio    MediaType = "WhatsApp Audio Keys"
 	MediaDocument MediaType = "WhatsApp Document Keys"
 )
@@ -38,6 +40,13 @@ func (wac *Conn) Send(msg interface{}) (string, error) {
 			return "ERROR", fmt.Errorf("image upload failed: %v", err)
 		}
 		msgProto = getImageProto(m)
+	case StickerMessage:
+		var err error
+		m.url, m.mediaKey, m.fileEncSha256, m.fileSha256, m.fileLength, err = wac.Upload(m.Content, MediaImage)
+		if err != nil {
+			return "ERROR", fmt.Errorf("image upload failed: %v", err)
+		}
+		msgProto = getStickerProto(m)
 	case VideoMessage:
 		var err error
 		m.url, m.mediaKey, m.fileEncSha256, m.fileSha256, m.fileLength, err = wac.Upload(m.Content, MediaVideo)
@@ -81,7 +90,7 @@ func (wac *Conn) Send(msg interface{}) (string, error) {
 			return "ERROR", fmt.Errorf("error decoding sending response: %v\n", err)
 		}
 		if int(resp["status"].(float64)) != 200 {
-			return "ERROR", fmt.Errorf("message sending responded with %d", resp["status"])
+			return "ERROR", fmt.Errorf("message sending responded with %v", resp["status"])
 		}
 		if int(resp["status"].(float64)) == 200 {
 			return getMessageInfo(msgProto).Id, nil
@@ -103,6 +112,105 @@ func (wac *Conn) sendProto(p *proto.WebMessageInfo) (<-chan string, error) {
 		Content: []interface{}{p},
 	}
 	return wac.writeBinary(n, message, ignore, p.Key.GetId())
+}
+
+// RevokeMessage revokes a message (marks as "message removed") for everyone
+func (wac *Conn) RevokeMessage(remotejid, msgid string, fromme bool) (revokeid string, err error) {
+	// create a revocation ID (required)
+	rawrevocationID := make([]byte, 10)
+	rand.Read(rawrevocationID)
+	revocationID := strings.ToUpper(hex.EncodeToString(rawrevocationID))
+	//
+	ts := uint64(time.Now().Unix())
+	status := proto.WebMessageInfo_PENDING
+	mtype := proto.ProtocolMessage_REVOKE
+
+	revoker := &proto.WebMessageInfo{
+		Key: &proto.MessageKey{
+			FromMe:    &fromme,
+			Id:        &revocationID,
+			RemoteJid: &remotejid,
+		},
+		MessageTimestamp: &ts,
+		Message: &proto.Message{
+			ProtocolMessage: &proto.ProtocolMessage{
+				Type: &mtype,
+				Key: &proto.MessageKey{
+					FromMe:    &fromme,
+					Id:        &msgid,
+					RemoteJid: &remotejid,
+				},
+			},
+		},
+		Status: &status,
+	}
+	if _, err := wac.Send(revoker); err != nil {
+		return revocationID, err
+	}
+	return revocationID, nil
+}
+
+// DeleteMessage deletes a single message for the user (removes the msgbox). To
+// delete the message for everyone, use RevokeMessage
+func (wac *Conn) DeleteMessage(remotejid, msgid string, fromMe bool) error {
+	ch, err := wac.deleteChatProto(remotejid, msgid, fromMe)
+	if err != nil {
+		return fmt.Errorf("could not send proto: %v", err)
+	}
+
+	select {
+	case response := <-ch:
+		var resp map[string]interface{}
+		if err = json.Unmarshal([]byte(response), &resp); err != nil {
+			return fmt.Errorf("error decoding deletion response: %v", err)
+		}
+		if int(resp["status"].(float64)) != 200 {
+			return fmt.Errorf("message deletion responded with %v", resp["status"])
+		}
+		if int(resp["status"].(float64)) == 200 {
+			return nil
+		}
+	case <-time.After(wac.msgTimeout):
+		return fmt.Errorf("deleting message timed out")
+	}
+
+	return nil
+}
+
+func (wac *Conn) deleteChatProto(remotejid, msgid string, fromMe bool) (<-chan string, error) {
+	tag := fmt.Sprintf("%s.--%d", wac.timeTag, wac.msgCount)
+
+	owner := "true"
+	if !fromMe {
+		owner = "false"
+	}
+	n := binary.Node{
+		Description: "action",
+		Attributes: map[string]string{
+			"epoch": strconv.Itoa(wac.msgCount),
+			"type":  "set",
+		},
+		Content: []interface{}{
+			binary.Node{
+				Description: "chat",
+				Attributes: map[string]string{
+					"type":  "clear",
+					"jid":   remotejid,
+					"media": "true",
+				},
+				Content: []binary.Node{
+					{
+						Description: "item",
+						Attributes: map[string]string{
+							"owner": owner,
+							"index": msgid,
+						},
+					},
+				},
+			},
+		},
+	}
+	return wac.writeBinary(n, chat, expires|skipOffline, tag)
 }
 
 func init() {
@@ -180,6 +288,7 @@ type ContextInfo struct {
 	QuotedMessage   *proto.Message
 	Participant     string
 	IsForwarded     bool
+	MentionedJid    []string //example : phonenumber@s.whatsapp.net
 }
 
 func getMessageContext(msg *proto.ContextInfo) ContextInfo {
@@ -189,20 +298,51 @@ func getMessageContext(msg *proto.ContextInfo) ContextInfo {
 		QuotedMessage:   msg.GetQuotedMessage(),
 		Participant:     msg.GetParticipant(),
 		IsForwarded:     msg.GetIsForwarded(),
+		MentionedJid:    msg.GetMentionedJid(),
 	}
 }
 
-func getContextInfoProto(context *ContextInfo) *proto.ContextInfo {
-	if len(context.QuotedMessageID) > 0 {
+/*
+ContextInfoProtoParam represents contextinfo of every message & text message that identify wheter the text contains mentioned phone number
+*/
+type ContextInfoProtoParam struct {
+	Context     *ContextInfo //context info param
+	TextMessage *string      //text message that identify wheter the text contains mentioned phone number
+}
+
+func getContextInfoProto(p ContextInfoProtoParam) *proto.ContextInfo {
+	var mentiondata []string
+	if *p.TextMessage != "" && strings.Contains(*p.TextMessage, "@") {
+		re := regexp.MustCompile(`@[0-9]{7,17}`)
+		for _, t := range re.FindAll([]byte(*p.TextMessage), -1) {
+			mentiondata = append(mentiondata, string(t)[1:]+"@s.whatsapp.net")
+		}
+	}
+	if len(p.Context.QuotedMessageID) > 0 {
 		contextInfo := &proto.ContextInfo{
-			StanzaId: &context.QuotedMessageID,
+			StanzaId:     &p.Context.QuotedMessageID,
+			MentionedJid: mentiondata,
 		}
 
-		if &context.QuotedMessage != nil {
-			contextInfo.QuotedMessage = context.QuotedMessage
-			contextInfo.Participant = &context.Participant
+		if &p.Context.QuotedMessage != nil {
+			contextInfo.QuotedMessage = p.Context.QuotedMessage
+			contextInfo.Participant = &p.Context.Participant
 		}
 
+		return contextInfo
+	}
+
+	if len(p.Context.MentionedJid) > 0 {
+		contextInfo := &proto.ContextInfo{
+			MentionedJid: mentiondata,
+		}
+		return contextInfo
+	}
+
+	if len(mentiondata) > 0 {
+		contextInfo := &proto.ContextInfo{
+			MentionedJid: mentiondata,
+		}
 		return contextInfo
 	}
 
@@ -233,12 +373,25 @@ func getTextMessage(msg *proto.WebMessageInfo) TextMessage {
 }
 
 func getTextProto(msg TextMessage) *proto.WebMessageInfo {
-	p := getInfoProto(&msg.Info)
-	contextInfo := getContextInfoProto(&msg.ContextInfo)
+	var mentiondata []string
+	re := regexp.MustCompile(`@[0-9]{7,17}`)
+	for _, t := range re.FindAll([]byte(msg.Text), -1) {
+		mentiondata = append(mentiondata, string(t)[1:]+"@s.whatsapp.net")
+	}
 
-	if contextInfo == nil {
+	p := getInfoProto(&msg.Info)
+	contextInfo := getContextInfoProto(ContextInfoProtoParam{&msg.ContextInfo, &msg.Text})
+
+	if contextInfo == nil && len(mentiondata) == 0 {
 		p.Message = &proto.Message{
 			Conversation: &msg.Text,
+		}
+	} else if contextInfo == nil && len(mentiondata) > 0 {
+		p.Message = &proto.Message{
+			ExtendedTextMessage: &proto.ExtendedTextMessage{
+				Text:        &msg.Text,
+				ContextInfo: contextInfo,
+			},
 		}
 	} else {
 		p.Message = &proto.Message{
@@ -291,7 +444,7 @@ func getImageMessage(msg *proto.WebMessageInfo) ImageMessage {
 
 func getImageProto(msg ImageMessage) *proto.WebMessageInfo {
 	p := getInfoProto(&msg.Info)
-	contextInfo := getContextInfoProto(&msg.ContextInfo)
+	contextInfo := getContextInfoProto(ContextInfoProtoParam{&msg.ContextInfo, &msg.Caption})
 
 	p.Message = &proto.Message{
 		ImageMessage: &proto.ImageMessage{
@@ -359,7 +512,7 @@ func getVideoMessage(msg *proto.WebMessageInfo) VideoMessage {
 
 func getVideoProto(msg VideoMessage) *proto.WebMessageInfo {
 	p := getInfoProto(&msg.Info)
-	contextInfo := getContextInfoProto(&msg.ContextInfo)
+	contextInfo := getContextInfoProto(ContextInfoProtoParam{&msg.ContextInfo, &msg.Caption})
 
 	p.Message = &proto.Message{
 		VideoMessage: &proto.VideoMessage{
@@ -424,7 +577,8 @@ func getAudioMessage(msg *proto.WebMessageInfo) AudioMessage {
 
 func getAudioProto(msg AudioMessage) *proto.WebMessageInfo {
 	p := getInfoProto(&msg.Info)
-	contextInfo := getContextInfoProto(&msg.ContextInfo)
+	text := ""
+	contextInfo := getContextInfoProto(ContextInfoProtoParam{&msg.ContextInfo, &text})
 	p.Message = &proto.Message{
 		AudioMessage: &proto.AudioMessage{
 			Url:           &msg.url,
@@ -491,7 +645,8 @@ func getDocumentMessage(msg *proto.WebMessageInfo) DocumentMessage {
 
 func getDocumentProto(msg DocumentMessage) *proto.WebMessageInfo {
 	p := getInfoProto(&msg.Info)
-	contextInfo := getContextInfoProto(&msg.ContextInfo)
+	text := ""
+	contextInfo := getContextInfoProto(ContextInfoProtoParam{&msg.ContextInfo, &text})
 	p.Message = &proto.Message{
 		DocumentMessage: &proto.DocumentMessage{
 			JpegThumbnail: msg.Thumbnail,
@@ -549,7 +704,8 @@ func GetLocationMessage(msg *proto.WebMessageInfo) LocationMessage {
 
 func GetLocationProto(msg LocationMessage) *proto.WebMessageInfo {
 	p := getInfoProto(&msg.Info)
-	contextInfo := getContextInfoProto(&msg.ContextInfo)
+	text := ""
+	contextInfo := getContextInfoProto(ContextInfoProtoParam{&msg.ContextInfo, &text})
 
 	p.Message = &proto.Message{
 		LocationMessage: &proto.LocationMessage{
@@ -602,7 +758,8 @@ func GetLiveLocationMessage(msg *proto.WebMessageInfo) LiveLocationMessage {
 
 func GetLiveLocationProto(msg LiveLocationMessage) *proto.WebMessageInfo {
 	p := getInfoProto(&msg.Info)
-	contextInfo := getContextInfoProto(&msg.ContextInfo)
+	text := ""
+	contextInfo := getContextInfoProto(ContextInfoProtoParam{&msg.ContextInfo, &text})
 	p.Message = &proto.Message{
 		LiveLocationMessage: &proto.LiveLocationMessage{
 			DegreesLatitude:                   &msg.DegreesLatitude,
@@ -661,6 +818,25 @@ func (m *StickerMessage) Download() ([]byte, error) {
 	return Download(m.url, m.mediaKey, MediaImage, int(m.fileLength))
 }
 
+func getStickerProto(msg StickerMessage) *proto.WebMessageInfo {
+	p := getInfoProto(&msg.Info)
+	text := ""
+	contextInfo := getContextInfoProto(ContextInfoProtoParam{&msg.ContextInfo, &text})
+
+	p.Message = &proto.Message{
+		StickerMessage: &proto.StickerMessage{
+			Url:           &msg.url,
+			MediaKey:      msg.mediaKey,
+			Mimetype:      &msg.Type,
+			FileEncSha256: msg.fileEncSha256,
+			FileSha256:    msg.fileSha256,
+			FileLength:    &msg.fileLength,
+			ContextInfo:   contextInfo,
+		},
+	}
+	return p
+}
+
 /*
 ContactMessage represents a contact message.
 */
@@ -690,7 +866,8 @@ func getContactMessage(msg *proto.WebMessageInfo) ContactMessage {
 
 func getContactMessageProto(msg ContactMessage) *proto.WebMessageInfo {
 	p := getInfoProto(&msg.Info)
-	contextInfo := getContextInfoProto(&msg.ContextInfo)
+	text := ""
+	contextInfo := getContextInfoProto(ContextInfoProtoParam{&msg.ContextInfo, &text})
 
 	p.Message = &proto.Message{
 		ContactMessage: &proto.ContactMessage{
@@ -740,6 +917,39 @@ func ParseProtoMessage(msg *proto.WebMessageInfo) interface{} {
 	default:
 		//cannot match message
 
+	}
+
+	return nil
+}
+
+/*
+BatteryMessage represents a battery level and charging state.
+*/
+type BatteryMessage struct {
+	Plugged    bool
+	Powersave  bool
+	Percentage int
+}
+
+func getBatteryMessage(msg map[string]string) BatteryMessage {
+	plugged, _ := strconv.ParseBool(msg["live"])
+	powersave, _ := strconv.ParseBool(msg["powersave"])
+	percentage, _ := strconv.Atoi(msg["value"])
+	batteryMessage := BatteryMessage{
+		Plugged:    plugged,
+		Powersave:  powersave,
+		Percentage: percentage,
+	}
+
+	return batteryMessage
+}
+
+func ParseNodeMessage(msg binary.Node) interface{} {
+	switch msg.Description {
+	case "battery":
+		return getBatteryMessage(msg.Attributes)
+	default:
+		//cannot match message
 	}
 
 	return nil
